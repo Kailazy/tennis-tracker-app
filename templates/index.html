@@ -1,0 +1,151 @@
+<html>
+  <head>
+	  <title>Tracker Robot</title>
+	  <meta http-equiv="cache-control" content="no-cache, must-revalidate, post-check=0, pre-check=0">
+	  <meta http-equiv="expires" content="Sat, 1 Jan 2016 00:00:00 GMT">
+	  <meta http-equiv='pragma' content='no-cache'>
+  </head>
+  <body>
+	<h1>Robot Tracker</h1>
+	<div style='display:table;'>
+		<img id=video src="{{ url_for('video_feed') }}" style='display:table-cell;'>
+		<div style='display:table-cell;vertical-align: bottom; padding-left:20px;'>
+			{% include 'chart.html' %}
+		</div>
+	</div>
+    <br>
+    <button onclick="d3.json('/update', { method:'POST'});setTimeout(function() { location.reload(); }, 5000);">Restart</button>
+    <button onclick="d3.json('/motion_reset', { method:'POST'})">Reset</button>
+    <button onclick="d3.json('/motion_tracking', { method:'POST'})">Tracking</button>
+    <button onclick="d3.json('/motion_jiggle', { method:'POST'})">Jiggle</button>
+    <button onmouseup="d3.json('/motion_left?speed=0', { method:'POST'})"  onmousedown="d3.json('/motion_left?speed=60', { method:'POST'})">Left</button>
+    <button onmouseup="d3.json('/motion_right?speed=0', { method:'POST'})"  onmousedown="d3.json('/motion_right?speed=60', { method:'POST'})">Right</button>
+    <button onmouseup="d3.json('/motion_fwd?speed=0', { method:'POST'})" onmousedown="d3.json('/motion_fwd?speed=120', { method:'POST'})">Forward</button>
+	<button onmouseup="d3.json('/motion_back?speed=0', { method:'POST'})" onmousedown="d3.json('/motion_back?speed=120', { method:'POST'})">Backward</button>
+	<br>
+    <label>Lower:</label><input id=lowerColor onchange='d3.json("/config", { method:"POST", body: `{ "detection.colorRange.lower": "${this.value}" }` })'>
+    <label>Upper:</label><input id=upperColor onchange='d3.json("/config", { method:"POST", body: `{ "detection.colorRange.upper": "${this.value}" }` })'>
+    <label>Speed:</label><input id=speed onchange='d3.json("/config", { method:"POST", body: `{ "motion.speed": "${this.value}" }` })'>
+	<label>Ramp:</label><input id=ramp onchange='d3.json("/config", { method:"POST", body: `{ "motion.ramp": "${this.value}" }` })'>
+
+	<script src="{{url_for('static', filename='d3.v5.min.js')}}" charset="utf-8"></script>
+
+    <script>
+      d3.json('/config', { method:'GET'})
+        .then(function(data) { 
+            d3.select('#upperColor').attr('value', data['detection.colorRange.upper']); 
+            d3.select('#lowerColor').attr('value', data['detection.colorRange.lower']); 
+            d3.select('#speed').attr('value', data['motion.speed']); 
+            d3.select('#ramp').attr('value', data['motion.ramp']); 
+        });
+
+		// Shortcuts
+		keyPressed = {};
+		d3.select("body")
+			.on("keydown", function(e) {
+				change = false;
+				if (d3.event.which == 27) {    // ESC
+					keyPressed = {};
+					change = true;
+				}
+				else if (d3.event.keyCode == 37 && !keyPressed["left"]) { //move left
+					keyPressed["left"] = 60;
+					change = true;
+				}
+				else if (d3.event.keyCode == 39 && !keyPressed["right"]) { //move right
+					keyPressed["right"] = 60;
+					change = true;
+				}
+				else if (d3.event.keyCode == 38 && !keyPressed["up"]) { //move up
+					keyPressed["up"] = 120;
+					change = true;
+				}
+				else if (d3.event.keyCode == 40 && !keyPressed["down"]) { //move down
+					keyPressed["down"] = 120;
+					change = true;
+				}
+
+				if (change) {
+					turn_speed = (keyPressed["left"] || 0) - (keyPressed["right"] || 0);
+					move_speed = (keyPressed["up"] || 0) - (keyPressed["down"] || 0);
+					d3.json(`motion_joystick?turn_speed=${turn_speed}&move_speed=${move_speed}`, { method:'POST'})
+					d3.event.preventDefault();
+					d3.event.stopPropagation();
+				}
+			})
+			.on("keyup", function(e) {
+				change = false;
+				if (d3.event.which == 27) {    // ESC
+					keyPressed = {};
+					change = true;
+				}
+				else if (d3.event.keyCode == 37) { //move left
+					delete keyPressed["left"];
+					change = true;
+				}
+				else if (d3.event.keyCode == 39) { //move right
+					delete keyPressed["right"];
+					change = true;
+				}
+				else if (d3.event.keyCode == 38) { //move up
+					delete keyPressed["up"];
+					change = true;
+				}
+				else if (d3.event.keyCode == 40) { //move down
+					delete keyPressed["down"];
+					change = true;
+				}
+
+				if (change) {
+					turn_speed = (keyPressed["left"] || 0) - (keyPressed["right"] || 0);
+					move_speed = (keyPressed["up"] || 0) - (keyPressed["down"] || 0);
+					d3.json(`motion_joystick?turn_speed=${turn_speed}&move_speed=${move_speed}`, { method:'POST'})
+					d3.event.preventDefault();
+					d3.event.stopPropagation();
+				}
+			})
+
+		// Joystick		
+		drag = function() {
+			var xOrigin = 0,
+				yOrigin = 0,
+				xDrag = 0,
+				yDrag = 0;
+
+			function dragstarted() {
+				xOrigin = d3.event.x;
+				yOrigin = d3.event.y;
+				d3.event.preventDefault();
+				d3.event.stopPropagation();
+			}
+
+			function dragged() {
+				// Check to see if we've changed the drag more than 5 pixels in any direction
+				if (Math.abs(d3.event.x - xDrag) > 5 || Math.abs(d3.event.y - yDrag) > 5) {
+					// Set the new
+					xDrag = d3.event.x;
+					yDrag = d3.event.y;
+					turn_speed = xDrag - xOrigin;
+					move_speed = yDrag - yOrigin;
+					d3.json(`motion_joystick?turn_speed=${turn_speed}&move_speed=${move_speed}`, { method:'POST'})
+					d3.event.preventDefault();
+					d3.event.stopPropagation();
+				}
+			}
+
+			function dragended() {
+				d3.json(`motion_joystick?turn_speed=0&move_speed=0`, { method:'POST'})
+				d3.event.preventDefault();
+				d3.event.stopPropagation();
+			}
+
+			return d3.drag()
+				.on("start", dragstarted)
+				.on("drag", dragged)
+				.on("end", dragended);
+		}
+		d3.select("#video").call(drag);
+
+    </script>
+  </body>
+</html>

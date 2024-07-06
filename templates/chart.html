@@ -1,0 +1,615 @@
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
+
+<div>
+	<style>
+
+		* {
+			font-family: sans-serif;
+		}
+
+		.axis--x path {
+			display: none;
+		}
+		
+		.line-back {
+			fill: none;
+			stroke: dotted gray;
+			stroke-width: .5px;
+		}		
+		.line {
+			fill: none;
+			stroke: steelblue;
+			stroke-width: 1.5px;
+		}
+		.zoom {
+			cursor: move;
+			fill: none;
+			pointer-events: all;
+		}
+
+		.overlay {
+			cursor: move;
+			fill: none;
+			pointer-events: all;
+		}
+
+		.tooltip circle {
+			fill: steelblue;
+		}
+
+		.tooltip text {
+			font-size: 14px;
+		}
+
+		.tooltip-box {
+			fill: white;
+			stroke: #000;
+		}
+
+		.tooltip-timestamp, .tooltip-value {
+			font-weight: bold;
+		}
+
+		label {
+			margin-left: 15px;
+			margin-right: 5px;
+		}
+		
+	</style>
+    <script src="{{url_for('static', filename='d3.v5.min.js')}}"></script>
+	
+	<div id=widget style="display:table;">
+		<div style="display:table-row;">
+			<label for="sessions">Session: </label><select name="sessions" id="sessions"></select>
+			<button style="float:right;" id=events_button onclick="location.href=`events?session=${widget.widget._vars.session.session}`">Download</button><br>
+		</div>
+		<div class=chart style="display:table-row;">
+			<hr>
+			<div>
+				<label for="types">Type: </label><select name="types" id="types"></select>
+				<label for="attributes">Attribute: </label><select name="attributes" id="attributes"></select>
+				<button style="float:right; display:flex; margin-left:10px;" id=events_button onclick="deleteChart(this)">Remove</button>
+				<button style="float:right;" id=events_button onclick="addChart(this)">Clone</button>
+			</div>
+			<svg width="800" height="320"></svg>
+		</div>
+	</div>
+	<script>
+
+		// Inspirations: 
+		// LineChart with Smooth Transitions by Fabio Mainardi
+		// https://bl.ocks.org/fabiomainardi/00d9920d48a910216bcd
+		// Brush & Zoon Line Chart by Efrat Vilenski
+		// https://bl.ocks.org/EfratVil/92f894ac0ba265192411e73f633a3e2f
+
+		// Common functions
+		var vars = {}, hash;
+		var hashes = window.location.href.slice(window.location.href.indexOf('?') + 1).split('&');
+		for (var i = 0; i < hashes.length; i++) {
+			hash = hashes[i].split('=');
+			vars[hash[0]] = hash[1] == 0 ? 0 :
+							hash[1] == "false" ? false :
+							hash[1];
+		}
+		var log = function(msg) {
+			console.log(`[${new Date().toUTCString()}] ${msg}`)
+		}
+
+		var parentNode = function(node, selector) {
+			if (!node.parentNode) return null;
+			if (node.parentNode.matches(selector)) {
+				return node.parentNode;
+			}
+			else {
+				return parentNode(node.parentNode, selector);
+			}
+		}
+
+		var addChart = function(node) {
+			var control = parentNode(node, "#widget");
+			var oldChart = parentNode(node, ".chart");
+			var newChart = d3.select(oldChart).clone([true]).node();
+			widget.initializeChart(control, newChart, oldChart._vars.type, oldChart._vars.attribute);
+			widget.refreshCycle(widget.widget, true); 
+		}
+
+		var deleteChart = function(node) {
+			var control = parentNode(node, "#widget");
+			if (d3.select(control).selectAll(".chart").size() > 1) {
+				d3.select(parentNode(node, ".chart")).remove();
+				widget.refreshCycle(widget.widget, true); 
+			}
+			else {
+				alert("Cannot delete last chart")
+			}
+		}
+
+		var Widget = (function() {
+
+			var parseDate = d3.timeParse("%Y-%m-%d %H:%M:%S.%L"),
+				dateFormatter = d3.timeFormat("%H:%M:%S.%L");
+			var defaults = {
+				voltage_stats: {
+					filter: (d, attr) => attr.match("voltage") && d.voltage > 0, 
+					attribute: "voltage" 
+				},
+				motion_stats: {
+					filter: (d, attr) => !attr.match("error"),
+				},
+			}
+
+			return function(widget) {
+
+				// Widget globals
+				widget._vars = {};
+				widget._vars.sessions = [];
+				widget._vars.session = null;
+				widget._vars.since = "";
+				widget._vars.events = [];
+				widget._vars.types = [];
+				widget._vars.timeout = null;
+				widget._vars.transform = null;
+				widget._vars.transitionDuration = 200;
+				widget._vars.callID = 0;
+
+				// Chart(s) globals
+				d3.select(widget).selectAll(".chart").each( function() { initializeChart(widget, this) } ); 
+
+				return {
+					refreshCycle: refreshCycle,
+					initializeChart: initializeChart,
+					widget: widget,
+				}
+			}			
+
+			function dropdown(selector, options, selected, valueFn, labelFn, clickFn) {
+				var options = selector.selectAll("option").data(options);
+				
+				// create the new options and update existing
+				options.enter().append("option");
+				selector.selectAll("option").attr("value", valueFn).text(labelFn).property("selected", o => (valueFn(o) == selected));
+
+				// remove old options
+				options.exit().remove();
+
+				// Update the selected option
+				//options.property("selected", o => (valueFn(o) == selected));
+				//selector.property("value", selected);
+
+				// reset the handler
+				selector.on("change", null).on("change", clickFn); //.property("value", selected);
+			}
+			function brushed(widget, chart) {
+				// ignore brush-by-zoom
+				if (d3.event.sourceEvent && d3.event.sourceEvent.type === "zoom") return; 
+
+				// Apply to all charts
+				d3.select(widget).selectAll(".chart").each(function() {
+					var chart = this;
+
+					// Get the brush details
+					var s = d3.event && d3.event.selection || chart._vars.x.range().map(widget._vars.transform.invertX, widget._vars.transform) || chart._vars.x2.range();
+					var x = d3.event.sourceEvent.clientX - chart._vars.svg.select(".context").node().getBoundingClientRect().x + 1;
+					if (x < s[0]) s = s.map(i => i + x - s[0])
+					else if (x > s[1]) s = s.map(i => i + x - s[1])
+
+					chart._vars.x.domain(s.map(chart._vars.x2.invert, chart._vars.x2));
+					chart._vars.svg.select(".canvas .line-back").attr("d", chart._vars.line);
+					chart._vars.svg.select(".canvas .line").attr("d", chart._vars.line);
+					chart._vars.svg.select(".viewport .axis--x").call(chart._vars.xAxis);
+					chart._vars.svg.select("rect.overlay").call(chart._vars.transform, d3.zoomIdentity.scale(chart._vars.width / (s[1] - s[0])).translate(-s[0], 0));
+					chart._vars.svg.select(".zoom").call(chart._vars.transform, d3.zoomIdentity.scale(chart._vars.width / (s[1] - s[0])).translate(-s[0], 0));
+				})
+			}
+			function zoomed(widget, chart) {
+				// ignore zoom-by-brush
+				if (d3.event.sourceEvent && d3.event.sourceEvent.type === "brush") return; 
+
+				// Get the transform details
+				var t = widget._vars.transform = d3.event.transform;
+
+				// Apply to all charts
+				d3.select(widget).selectAll(".chart").each(function() {
+					var chart = this;
+					chart._vars.x.domain(t.rescaleX(chart._vars.x2).domain());
+					chart._vars.svg.select(".canvas .line-back").attr("d", chart._vars.line);
+					chart._vars.svg.select(".canvas .line").attr("d", chart._vars.line);
+					chart._vars.svg.select(".viewport .axis--x").call(chart._vars.xAxis);
+					chart._vars.svg.select(".context .brush").call(chart._vars.brush.move, chart._vars.x.range().map(t.invertX, t));
+				})
+			}
+
+			function initializeChart(widget, chart, type, attribute) {
+				chart._vars = {};
+				chart._vars.type = type;
+				chart._vars.attributes = [];
+				chart._vars.attribute = attribute;
+				chart._vars.svg = d3.select(chart).select("svg").html("");
+				chart._vars.margin = {top: 20, right: 20, bottom: 100, left: 50};
+				chart._vars.margin2 = {top: 250, right: 20, bottom: 20, left: 50};
+				chart._vars.width = +chart._vars.svg.attr("width") - chart._vars.margin.left - chart._vars.margin.right;
+				chart._vars.height = +chart._vars.svg.attr("height") - chart._vars.margin.top - chart._vars.margin.bottom;
+				chart._vars.height2 = +chart._vars.svg.attr("height") - chart._vars.margin2.top - chart._vars.margin2.bottom;
+				chart._vars.x = d3.scaleTime().range([0, chart._vars.width]);
+				chart._vars.y = d3.scaleLinear().range([chart._vars.height, 0]);
+				chart._vars.x2 = d3.scaleTime().range([0, chart._vars.width]);
+				chart._vars.y2 = d3.scaleLinear().range([chart._vars.height2, 0]);
+				chart._vars.xAxis = d3.axisBottom(chart._vars.x);
+				chart._vars.xAxis2 = d3.axisBottom(chart._vars.x2);
+				chart._vars.yAxis = d3.axisLeft(chart._vars.y);
+				chart._vars.brush = d3.brushX()
+					.extent([[0, 0], [chart._vars.width, chart._vars.height2]]);
+				chart._vars.zoom = d3.zoom()
+					.scaleExtent([1, Infinity])
+					.translateExtent([[0, 0], [chart._vars.width, chart._vars.height]])
+					.extent([[0, 0], [chart._vars.width, chart._vars.height]]);
+					
+				// At the highest level add the defs, viewport, canvas, context, and overlay
+				chart._vars.svg.append("defs").append("svg:clipPath")
+					.attr("id", "clip")
+					.append("svg:rect")
+					.attr("width", chart._vars.width)
+					.attr("height", chart._vars.height)
+					.attr("x", 0)
+					.attr("y", 0); 
+				chart._vars.canvas = chart._vars.svg.append("g")
+					.attr("class", "focus canvas")
+					.attr("transform", "translate(" + chart._vars.margin.left + "," + chart._vars.margin.top + ")")
+					.attr("clip-path", "url(#clip)");
+				chart._vars.viewport = chart._vars.svg.append("g")
+					.attr("class", "focus viewport")
+					.attr("transform", "translate(" + chart._vars.margin.left + "," + chart._vars.margin.top + ")");
+				chart._vars.context = chart._vars.svg.append("g")
+					.attr("class", "context")
+					.attr("transform", "translate(" + chart._vars.margin2.left + "," + chart._vars.margin2.top + ")");
+				chart._vars.overlay = chart._vars.svg.append("rect")
+					.attr("class", "overlay")
+					.attr("width", chart._vars.width)
+					.attr("height", chart._vars.height)
+					.attr("transform", "translate(" + chart._vars.margin.left + "," + chart._vars.margin.top + ")")
+					.call(chart._vars.zoom);
+				chart._vars.svg
+					.on("mouseover", null)
+					.on("mouseover", function() {
+						var position = d3.mouse(chart._vars.viewport.node());
+						if (position[1] < chart._vars.height) {
+							d3.select(widget).selectAll(".chart").each(function() { this._vars.tooltip.style("display", null) })
+							//chart._vars.tooltip.style("display", null);
+						}
+						else {
+							d3.select(widget).selectAll(".chart").each(function() { this._vars.tooltip.style("display", "none") })
+							//chart._vars.tooltip.style("display", "none");
+						}
+					})
+					.on("mouseout", null)
+					.on("mouseout", function() { 
+						d3.select(widget).selectAll(".chart").each(function() { this._vars.tooltip.style("display", "none") })
+					})
+					.on("mousemove", null)
+					.on("mousemove", function() {
+						var position = d3.mouse(chart._vars.viewport.node());
+						var x0 = chart._vars.x.invert(position[0]),
+							ii = 0;
+							d = chart._vars.data.find(function(e,i) { ii = i; return e.timestamp > x0; } );
+							d = chart._vars.data[ii>0 ? ii-1 : ii];
+						if (d && position[1] <= chart._vars.height) {
+							d3.select(widget).selectAll(".chart").each(function() {
+								var chart = this;
+
+								// skip this chart if not setup yet
+								//if (!chart._vars) return;
+
+								var tooltip = d3.select(chart).select(".tooltip");
+								var text1 = tooltip.select(".tooltip-timestamp").text(d.time);
+								var text2 = tooltip.select(".tooltip-attr").text(chart._vars.attribute + ": " + d[chart._vars.attribute]);
+								var tooltipWidth = Math.max(200, text1.node().getBBox().width + 10, text2.node().getBBox().width + 10);
+								tooltip.attr("transform", `translate(${(chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? 
+																	chart._vars.x(d.timestamp) - tooltipWidth - 10 : 
+																	chart._vars.x(d.timestamp)) || 0}, ${(chart._vars.y(d[chart._vars.attribute])) || 0})`);
+								tooltip.select(".tooltip-vert-line").attr("x1", chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? tooltipWidth + 10 : 0)
+																	.attr("x2", chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? tooltipWidth + 10 : 0)
+																	.attr("transform", `translate(0, ${(-chart._vars.y(d[chart._vars.attribute])) || 0})` );
+								tooltip.select(".tooltip-hor-line").attr("transform", `translate(${(-(chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? 
+																	chart._vars.x(d.timestamp) - tooltipWidth - 10 : 
+																	chart._vars.x(d.timestamp))) || 0}, 0)` );
+								tooltip.select(".tooltip-circle").attr("cx", chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? tooltipWidth + 10 : 0);
+								tooltip.select(".tooltip-box").attr("x", chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? 0 : 10).attr("width", tooltipWidth);
+								tooltip.select(".tooltip-timestamp").attr("x", chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? 8 : 8 + 10);
+								tooltip.select(".tooltip-attr").attr("x", chart._vars.x(d.timestamp) + tooltipWidth > chart._vars.width ? 8 : 8 + 10);
+							})
+						}
+					});
+
+				// In the viewport, add the axis and tooltip
+				chart._vars.viewport.append("g")
+					.attr("class", "axis axis--x")
+					.attr("transform", "translate(0," + chart._vars.height + ")");
+				//	.attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+				chart._vars.viewport.append("g")
+					.attr("class", "axis axis--y")
+					.append("text")
+					.attr("class", "axis--y--label")
+					.attr("fill", "#000")
+					.attr("transform", "rotate(-90)")
+					.attr("y", 6)
+					.attr("dy", "0.71em")
+					.style("text-anchor", "end");
+				chart._vars.tooltip = chart._vars.viewport.append("g")
+					.attr("class", "tooltip")
+					.style("display", "none");
+				chart._vars.tooltip.append("line")
+					.attr("class", "tooltip-vert-line")
+					.attr("x1", 0)
+					.attr("y1", 0)
+					.attr("x2", 0)
+					.attr("y2", chart._vars.height)
+					.attr("opacity", 0.5)
+					.attr("stroke", "gray");
+				chart._vars.tooltip.append("line")
+					.attr("class", "tooltip-hor-line")
+					.attr("x1", 0)
+					.attr("y1", 0)
+					.attr("x2", chart._vars.width)
+					.attr("y2", 0)
+					.attr("opacity", 0.5)
+					.attr("stroke", "gray")
+				chart._vars.tooltip.append("circle")
+					.attr("class", "tooltip-circle")
+					.attr("r", 5);
+				chart._vars.tooltip.append("rect")
+					.attr("class", "tooltip-box")
+					.attr("width", 200)
+					.attr("height", 50)
+					.attr("x", 10)
+					.attr("y", -22)
+					.attr("rx", 4)
+					.attr("ry", 4);
+				chart._vars.tooltip.append("text")
+					.attr("class", "tooltip-timestamp")
+					.attr("x", 18)
+					.attr("y", -2);
+				chart._vars.tooltip.append("text")
+					.attr("class", "tooltip-attr")
+					.attr("x", 18)
+					.attr("y", 18);
+					
+				// In the canvas, add the line(s) and the overlay
+				chart._vars.canvas.append("path")
+					.attr("class", "line-back"),
+				chart._vars.canvas.append("path")
+					.attr("class", "line");
+
+				// In the context, add the second line(s) and the brush
+				chart._vars.context.append("g")
+					.attr("class", "axis axis--x")
+					.attr("transform", "translate(0," + chart._vars.height2 + ")");
+				chart._vars.context.append("path")
+					.attr("class", "line-back");
+				chart._vars.context.append("path")
+					.attr("class", "line");
+				chart._vars.context.append("g")
+					.attr("class", "brush")
+					.call(chart._vars.brush)
+					.call(chart._vars.brush.move, chart._vars.x.range())
+					.select(".overlay")
+					.style("stroke", "lightgray");
+				chart._vars.svg.append("rect")
+					.attr("class", "zoom")
+					.attr("width", chart._vars.width)
+					.attr("height", chart._vars.height)
+					.attr("transform", "translate(" + chart._vars.margin.left + "," + chart._vars.margin.top + ")")
+					.call(chart._vars.zoom);
+			}
+
+			async function refreshCycle(widget, forceUpdate) {
+				clearTimeout(widget._vars.timeout);
+
+				var cID = ++widget._vars.callID;
+				log(`starting refresh ${cID} with forceUpdate=${forceUpdate}`);
+
+				// Extract the sessions and update the dropdown
+				if (forceUpdate || !widget._vars.sessions || widget._vars.sessions.length == 0) {
+					// Read the sessions from the server
+					widget._vars.sessions = (await d3.json(`/sessions`))
+						.filter(function(d) {
+							d.from = parseDate(d.from.match(/.+[.]\d\d\d/));	// cut milliseconds only to 3 digits
+							d.to = parseDate(d.to.match(/.+[.]\d\d\d/));		// cut milliseconds only to 3 digits
+							return true;
+						})
+						.sort(function(a, b) {
+							return b.from < a.from ? -1 : b.from > a.from ? +1 : 0;
+						});
+
+					// Update the sessions dropdown
+					widget._vars.session = widget._vars.session || widget._vars.sessions.length > 0 && widget._vars.sessions[0];
+					dropdown(d3.select(widget).select("#sessions"), widget._vars.sessions, widget._vars.session.session, 
+						d => d.session, 
+						d => `${d.session}: ${d.from.toLocaleString()} to ${d.to.toLocaleString()} - ${d.count} events ${d.current ? " (current)" : ""}`, 
+						function(d) { 
+							widget._vars.session = widget._vars.sessions.find(s => s.session == this.value); 
+							widget._vars.since = "";
+							widget._vars.events = [];
+							widget._vars.types = [];
+							refreshCycle(widget, true); 
+						});	// Only change the session but refresh will validate the attribute
+				}
+
+				// Read the events from the server and add them to the global list
+				var events = (await d3.json(`/events?limit=99999${widget._vars.since ? "&since=" + widget._vars.since : ""}${widget._vars.session.session ? "&session=" + widget._vars.session.session : ""}&flat=true`))
+					.filter(function(d) {
+						// Filter empty events
+						if (Object.keys(d).length == 0) return false;
+						if (d.error) return false;
+						// Convert all numeric attributes
+						for (var attr in d) {
+							if (typeof d[attr] == 'number') {
+								d[attr] = Math.round(d[attr] * 100) / 100;
+							} 						
+						}
+						// Capture the max of time
+						widget._vars.since = widget._vars.since < d.time ? d.time : widget._vars.since;
+						d.timestamp = parseDate(d.time.match(/.+[.]\d\d\d/));	// cut milliseconds only to 3 digits
+						return true;
+					})
+					// sort the events to show them in order
+					.sort(function(a, b) {
+						return a.timestamp - b.timestamp;
+					});
+				widget._vars.events.push(...events);
+
+				// Extract the new types and add them to the global list
+				var typesUpdate = false;
+				events.reduce(function(typeList, event) {
+					if (!typeList[event.type]) {
+						typeList.push(typeList[event.type] = { type: event.type, sample: event });							// add it as an index array member
+						typesUpdate = true;
+					}
+					return typeList;
+				}, widget._vars.types);
+
+				// Update the type dropdown if there was a new type introduced
+				if (forceUpdate || typesUpdate) {
+
+					d3.select(widget).selectAll(".chart")
+						.each( function() {
+							var chart = this; //d3.select(this);
+
+							// Update the types dropdown
+							chart._vars.type = chart._vars.type || widget._vars.types.length > 0 && widget._vars.types[0];
+							dropdown(d3.select(chart).select("#types"), widget._vars.types, chart._vars.type.type, 
+								d => d.type, 
+								d => d.type, 
+								function(d) { 
+									chart._vars.type = widget._vars.types[this.value]; 
+									refreshCycle(widget, true); 
+								});		// Only change the type but refresh will validate the session and the attribute
+
+							// Update the attributes dropwdown
+							chart._vars.attributes = Object.keys(chart._vars.type && chart._vars.type.sample || {}).filter(attr => attr != "timestamp" && !isNaN(chart._vars.type.sample[attr] * 1));
+							chart._vars.attribute = chart._vars.attributes.includes(chart._vars.attribute) && chart._vars.attribute || 
+								defaults[chart._vars.type] && defaults[chart._vars.type].attribute || 
+								chart._vars.attributes.length > 0 && chart._vars.attributes[0] || 
+								"";
+							dropdown(d3.select(chart).select("#attributes"), chart._vars.attributes, chart._vars.attribute, 
+								d => d, 
+								d => d, 
+								function(d) { 
+									chart._vars.attribute = this.value; 
+									refreshCycle(widget, true); 
+								});	// Only change the attribute
+						})
+				}
+
+				// Update the chart if there was a forced update or just new data
+				if (forceUpdate || events.length > 0) {
+
+					d3.select(widget).selectAll(".chart")
+						.each( function() {
+							var chart = this; //d3.select(this);
+
+							// Filter only the relevant events to chart out
+							chart._vars.data = widget._vars.events.filter(function(d) {
+								if (d.error) return false;
+								if (d.type != chart._vars.type.type) return false;
+								if (defaults[chart._vars.type.type] && 
+									defaults[chart._vars.type.type].filter && 
+									!defaults[chart._vars.type.type].filter(d, chart._vars.attribute)) return false;
+								return true;				
+							});
+
+							renderData(widget, chart);
+
+							log(`finished rendering ${cID} with forceUpdate=${forceUpdate} and ${chart._vars.data.length} points`);
+						})
+
+				}
+
+				// if current session (not looking in history) schedule next refresh cycle, but make the schedule wait for each execution to avoid contentions
+				if (widget._vars.session && widget._vars.session.current) {
+					widget._vars.timeout = setTimeout(async function() { await refreshCycle(widget); }, 1000);
+				}
+			}
+
+			function renderData(widget, chart) {
+
+				// Redefine the x/y domains given the new data
+				chart._vars.x.domain(d3.extent(chart._vars.data, function(d) { return d.timestamp; }));
+				chart._vars.y.domain(d3.extent(chart._vars.data, function(d) { return d[chart._vars.attribute]; }));
+				chart._vars.x2.domain(chart._vars.x.domain());
+				chart._vars.y2.domain(chart._vars.y.domain());
+			
+				// Redfine the line function given the new data and attribute
+				chart._vars.line = d3.line()
+					.defined((d, i) => !isNaN(d[chart._vars.attribute]) && !d.series_start) 
+					.x(d => chart._vars.x(d.timestamp))
+					.y(d => chart._vars.y(d[chart._vars.attribute]));
+				chart._vars.line2 = d3.line()
+					.defined((d, i) => !isNaN(d[chart._vars.attribute]) && !d.series_start)
+					.x(d => chart._vars.x2(d.timestamp))
+					.y(d => chart._vars.y2(d[chart._vars.attribute]));
+
+				// Redefine the brush given the new data and attribute
+				chart._vars.brush.on("brush end", null).on("brush end", function() { brushed(widget, chart) });
+				chart._vars.zoom.on("zoom", null).on("zoom", function() { zoomed(widget, chart) });
+				if (widget._vars.transform) {
+					chart._vars.x.domain(widget._vars.transform.rescaleX(chart._vars.x2).domain());
+				}
+
+				// Get the viewport, canvas and context
+				var viewport = chart._vars.svg.select(".viewport");
+				var canvas = chart._vars.svg.select(".canvas");
+				var context = chart._vars.svg.select(".context");
+				var overlay = chart._vars.svg.select("rect.overlay");
+
+				// Morph the viewport x-axis and y-axis to the given new data and attribute
+				viewport.select(".axis--x")
+					.transition()
+					.duration(widget._vars.transitionDuration)
+					.call(chart._vars.xAxis);
+				viewport.select(".axis--y")
+					.transition()
+					.duration(widget._vars.transitionDuration)
+					.call(chart._vars.yAxis)
+					.select("axis--y--label").text(chart._vars.attribute);
+
+				// Morph the canvas x-axis and line to the given new data and attribute and adjust the canvas overlay
+				canvas.select(".axis--x")
+					.transition()
+					.duration(widget._vars.transitionDuration)
+					.call(chart._vars.xAxis2);		
+				canvas.select(".line-back")
+					.datum(chart._vars.data.filter(chart._vars.line.defined()))
+					.transition()
+					.duration(widget._vars.transitionDuration)
+					.attr("d", chart._vars.line);
+				canvas.select(".line")
+					.datum(chart._vars.data)
+					.transition()
+					.duration(widget._vars.transitionDuration)
+					.attr("d", chart._vars.line);
+
+				// Morph the context line to the given new data and attribute
+				context.select(".line-back")
+					.datum(chart._vars.data.filter(chart._vars.line2.defined()))
+					.transition()
+					.duration(widget._vars.transitionDuration)
+					.attr("d", chart._vars.line2);
+				context.select(".line")
+					.datum(chart._vars.data)
+					.transition()
+					.duration(widget._vars.transitionDuration)
+					.attr("d", chart._vars.line2);
+
+				// Preserve the zoom
+			}
+
+		})()
+		
+		var widget = Widget(d3.select("#widget").node());
+		widget.refreshCycle(widget.widget, true);
+
+	</script>
+</div>
+

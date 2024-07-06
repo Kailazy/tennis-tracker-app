@@ -1,0 +1,15 @@
+cv==1.0.0
+deepdiff==5.0.2
+Flask==1.1.2
+getkey==0.6.5
+importlib-metadata==4.6.4
+imutils==0.5.3
+minimalmodbus==1.0.2
+numpy==1.19.1
+opencv-python==4.3.0.36
+optional-django==0.1.0
+pipenv==2021.5.29
+requests==2.24.0
+urllib3==1.25.9
+virtualenv==20.7.2
+virtualenv-clone==0.5.6

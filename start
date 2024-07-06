@@ -1,0 +1,11 @@
+# Pull the latest sources
+git pull
+
+# Kill the current running python3
+#ps -ef | grep python3 | awk '{ kill -9 $2 }'
+pkill -f tracker.py
+
+# Start python3 with the tracker app
+#python3 tracker.py &
+#python3 tracker.py -snd foo.bar &    # no sound
+python3 tracker.py -snd foo.bar |& tee -a tracker.log | grep Running &
