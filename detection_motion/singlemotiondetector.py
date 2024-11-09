@@ -119,3 +119,5 @@ class SingleMotionDetector:
 			with self.lock:
 				self.outputFrame = frame.copy()
 
+			# going to refactor this project at some point soon !
+
